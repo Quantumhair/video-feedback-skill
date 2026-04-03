@@ -14,21 +14,35 @@ Analyze video recordings to extract what the user said (audio transcription) and
 
 ## Architecture: Context-Efficient Pipeline
 
+Two paths based on video length. Both keep images out of the main context.
+
+**Path A -- Parallel (under 5 min):** Fast. Extract everything, sync after.
+
 ```
-Main Agent                          Sub-Agents (disposable context)
-──────────                          ──────────────────────────────
-1. Download video (yt-dlp)   ───>
-2. Extract metadata (ffprobe) ──>
-3. Extract frames (ffmpeg)   ───>
-4. Extract audio (ffmpeg)    ───>
-5. Transcribe audio (whisper) ──>
-6. Split frames into batches ───>  7. Read images (vision)
-                                      Write text descriptions
-                                      to batch_N_analysis.md
-8. Read text files only      <──   (context discarded)
-9. Sync transcript + visual  ───>
-10. Resolve project context  ───>
-11. Produce actionable report
+1. Download video ──────────────>
+2. Extract metadata ────────────>
+3. Extract frames ──┐
+4. Extract audio ───┤ (parallel)
+5. Transcribe ──────┘
+6. Batch frames ────────────────>  Sub-agents: read images, write text
+7. Read text summaries <─────────  (image context discarded)
+8. Sync transcript + visual ────>
+9. Produce actionable report
+```
+
+**Path B -- Audio-first (5 min or longer):** Smarter. Transcribe first, extract only the frames that matter.
+
+```
+1. Download video ──────────────>
+2. Extract metadata ────────────>
+3. Extract audio ───────────────>
+4. Transcribe ──────────────────>
+5. Identify feedback moments ───>  (analyze transcript for key timestamps)
+6. Extract targeted frames ─────>  (only around feedback moments)
+7. Batch frames ────────────────>  Sub-agents: read images, write text
+8. Read text summaries <─────────  (image context discarded)
+9. Sync transcript + visual ────>
+10. Produce actionable report
 ```
 
 Images only ever exist inside sub-agent contexts. The main agent only reads lightweight text files. This cuts context usage by ~90%.
@@ -98,27 +112,40 @@ Extract and note: duration, resolution (width x height), fps, codec, file size, 
 If no video stream is found, report "audio-only file" and STOP.
 If file size > 2GB, warn the user and suggest analyzing a time range.
 
-## 5. Extract Frames
+## 5. Choose Pipeline Strategy
 
-Choose strategy based on duration:
+Based on duration from step 4, choose one of two paths:
+
+| Duration | Strategy | Why |
+|----------|----------|-----|
+| **Under 5 minutes** | **Parallel** -- extract frames and audio simultaneously, sync after | Fast. Few enough frames that blanket extraction is cheap. |
+| **5 minutes or longer** | **Audio-first** -- transcribe first, then extract targeted frames around feedback moments | Smarter. Avoids extracting hundreds of irrelevant frames. |
+
+---
+
+### Path A: Parallel Pipeline (under 5 minutes)
+
+Use this path for short videos. Extract frames and audio at the same time, analyze everything, sync later.
+
+#### A1. Extract Frames
+
+Run frame extraction and audio extraction **in parallel** (both are independent).
+
+Choose frame strategy based on duration:
 
 | Duration | Strategy | Command |
 |----------|----------|---------|
 | 0-60s | 1 frame every 2s | `ffmpeg -hide_banner -y -i "$VIDEO" -vf "fps=1/2,scale='min(1280,iw)':-2" -q:v 5 "$TMPDIR/frame_%04d.jpg"` |
-| 1-10min | Scene detection (threshold 0.3) | `ffmpeg -hide_banner -y -i "$VIDEO" -vf "select='gt(scene,0.3)',scale='min(1280,iw)':-2" -vsync vfr -q:v 5 "$TMPDIR/scene_%04d.jpg"` |
-| 10-30min | Keyframe extraction | `ffmpeg -hide_banner -y -skip_frame nokey -i "$VIDEO" -vf "scale='min(1280,iw)':-2" -vsync vfr -q:v 5 "$TMPDIR/key_%04d.jpg"` |
-| 30min+ | Thumbnail filter | `ffmpeg -hide_banner -y -i "$VIDEO" -vf "thumbnail=SEGMENT_FRAMES,scale='min(1280,iw)':-2" -vsync vfr -q:v 5 "$TMPDIR/thumb_%04d.jpg"` |
-
-For thumbnail filter, calculate `SEGMENT_FRAMES = total_frames / 60` to cap output at ~60 frames.
+| 1-5min | Scene detection (threshold 0.3) | `ffmpeg -hide_banner -y -i "$VIDEO" -vf "select='gt(scene,0.3)',scale='min(1280,iw)':-2" -vsync vfr -q:v 5 "$TMPDIR/scene_%04d.jpg"` |
 
 **Fallbacks:**
 - Scene detection yields 0 frames -> retry with interval at 1 frame/5s
 - More than 100 frames extracted -> subsample evenly to 80
-- Frame extraction fails -> try the next simpler strategy (scene -> interval, keyframe -> interval)
+- Frame extraction fails -> fall back to interval strategy (1 frame/5s)
 
 After extraction, list all frame files and calculate each frame's timestamp from its sequence number and the extraction rate.
 
-## 6. Extract Audio
+#### A2. Extract Audio (run in parallel with A1)
 
 If metadata shows audio is present:
 
@@ -128,7 +155,7 @@ ffmpeg -hide_banner -y -i "$VIDEO" -vn -acodec pcm_s16le -ar 16000 -ac 1 "$TMPDI
 
 If no audio stream exists, skip transcription entirely and note "No audio track -- visual analysis only."
 
-## 7. Transcribe Audio
+#### A3. Transcribe Audio
 
 ```bash
 python3 -c "
@@ -143,20 +170,77 @@ print('Transcription complete:', len(result['segments']), 'segments')
 
 Then read `$TMPDIR/transcript.json`. Each segment has `start`, `end`, and `text` fields.
 
-Format transcript segments for reference:
+#### A4. Delegate Frame Analysis
 
+Proceed to **step 6** (Delegate Frame Analysis) with all extracted frames.
+
+---
+
+### Path B: Audio-First Pipeline (5 minutes or longer)
+
+Use this path for longer videos. Transcribe first, identify the moments that matter, then extract frames only around those moments.
+
+#### B1. Extract Audio
+
+```bash
+ffmpeg -hide_banner -y -i "$VIDEO" -vn -acodec pcm_s16le -ar 16000 -ac 1 "$TMPDIR/audio.wav"
 ```
-[0:00-0:05] "First thing I notice is the header is too crowded"
-[0:05-0:12] "If you look at the spacing between these nav items..."
+
+If no audio stream exists, fall back to **Path A** frame extraction strategies (keyframes for 5-30min, thumbnail filter for 30min+) and skip transcription. Note "No audio track -- visual analysis only."
+
+#### B2. Transcribe Audio
+
+```bash
+python3 -c "
+import whisper, json
+model = whisper.load_model('base')
+result = model.transcribe('$TMPDIR/audio.wav', word_timestamps=True)
+with open('$TMPDIR/transcript.json', 'w') as f:
+    json.dump(result, f, indent=2)
+print('Transcription complete:', len(result['segments']), 'segments')
+"
 ```
 
-**Quality note:** If transcript quality is poor (garbled, missing words), the user can re-run with a larger model by setting `WHISPER_MODEL=small` or `WHISPER_MODEL=medium`. The base model is fastest but least accurate.
+Read `$TMPDIR/transcript.json` and format the segments.
 
-## 8. Delegate Frame Analysis to Sub-Agents
+#### B3. Identify Feedback Moments
+
+Analyze the transcript to find **feedback windows** -- clusters of segments where the user is actively giving feedback, pointing things out, or requesting changes. Look for:
+- Evaluative language ("this should be", "I don't like", "change this", "the spacing here", "this is broken")
+- Demonstrative references ("over here", "this button", "right here", "you can see")
+- Transition phrases ("next thing", "also", "another issue", "moving on to")
+
+Group nearby segments (within 5 seconds of each other) into windows. For each window, define an extraction range: **start timestamp minus 3 seconds** through **end timestamp plus 3 seconds** (clamped to video bounds). This captures the visual context the user was looking at while speaking.
+
+Also include:
+- The **first 5 seconds** of the video (establishes what page/app is being reviewed)
+- Any **long silent gaps** (> 10 seconds) -- extract one frame from the midpoint (the user may be navigating without narrating)
+
+#### B4. Extract Targeted Frames
+
+For each feedback window, extract frames at 1 frame per 2 seconds within that range:
+
+```bash
+ffmpeg -hide_banner -y -i "$VIDEO" -vf "select='between(t\,START\,END)',scale='min(1280,iw)':-2" -vsync vfr -q:v 5 "$TMPDIR/targeted_%04d.jpg"
+```
+
+If multiple windows exist, either run one ffmpeg command with a combined select filter or run separate commands with distinct output prefixes.
+
+**Target:** Aim for 30-60 total frames regardless of video length. If the feedback windows produce more, subsample evenly to 60.
+
+#### B5. Delegate Frame Analysis
+
+Proceed to **step 6** (Delegate Frame Analysis) with the targeted frames.
+
+---
+
+**Quality note for transcription:** If transcript quality is poor (garbled, missing words), the user can re-run with a larger model by setting `WHISPER_MODEL=small` or `WHISPER_MODEL=medium`. The base model is fastest but least accurate.
+
+## 6. Delegate Frame Analysis to Sub-Agents
 
 **Do NOT read frame images in the main conversation.** Split frames into batches and delegate to sub-agents.
 
-### 8a. Prepare Batch Manifest
+### 6a. Prepare Batch Manifest
 
 Split extracted frame files into batches of 8-10 frames each. For each batch, record:
 - Batch number (1, 2, 3, ...)
@@ -164,7 +248,7 @@ Split extracted frame files into batches of 8-10 frames each. For each batch, re
 - Frame timestamps
 - Output file path: `$TMPDIR/batch_N_analysis.md`
 
-### 8b. Spawn Sub-Agents
+### 6b. Spawn Sub-Agents
 
 For each batch, spawn a sub-agent with this prompt. **Launch all batches in parallel** -- they are fully independent.
 
@@ -207,7 +291,7 @@ Use the Agent tool to spawn each sub-agent. If the tool supports parallel launch
 
 **Fallback:** If sub-agents fail (permission errors, timeouts), read frames directly in the main context. Subsample to **20 frames maximum** -- pick every Nth frame to get even coverage. Warn about context usage for longer videos.
 
-### 8c. Collect Results
+### 6c. Collect Results
 
 After all sub-agents complete, read all batch analysis files in order:
 
@@ -217,7 +301,7 @@ ls "$TMPDIR"/batch_*_analysis.md
 
 Read each file. These contain only text -- no images enter the main context.
 
-## 9. Synthesize: Sync Transcript with Visual Analysis
+## 7. Synthesize: Sync Transcript with Visual Analysis
 
 This is the core value step. Merge the Whisper transcript (what the user said) with the frame analysis (what was on screen) into a unified timeline.
 
@@ -238,7 +322,7 @@ Produce a **Feedback Extract** -- timestamped entries like:
   -> Feedback: Make CTA button more visually prominent (size, color, or contrast).
 ```
 
-## 10. Resolve Project Context
+## 8. Resolve Project Context
 
 Before generating the action plan, determine what project/files this feedback applies to:
 
@@ -250,7 +334,7 @@ Before generating the action plan, determine what project/files this feedback ap
 
 **Important:** Not all feedback maps to code. It could be about a document, email draft, marketing plan, design, or anything else. Don't assume it's always a codebase change.
 
-## 11. Produce Action Plan
+## 9. Produce Action Plan
 
 Based on the feedback extract and resolved context, generate one of two outputs:
 
@@ -289,6 +373,6 @@ Choose simple vs. complex based on:
 - Whether project context is clear (unclear = complex)
 - Whether changes require design decisions (yes = complex)
 
-## 12. Cleanup
+## 10. Cleanup
 
 The `.video-feedback-tmp/` directory is gitignored and will be overwritten on the next run. No cleanup needed -- leave the files in place. If the user explicitly asks to clean up, tell them to run `rm -rf .video-feedback-tmp` manually.
