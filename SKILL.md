@@ -19,15 +19,14 @@ Two paths based on video length. Both keep images out of the main context.
 **Path A -- Parallel (under 5 min):** Fast. Extract everything, sync after.
 
 ```
-1. Download video ──────────────>
+1. Download video + subtitles ──>
 2. Extract metadata ────────────>
 3. Extract frames ──┐
 4. Extract audio ───┤ (parallel)
-5. Transcribe ──────┘
-6. Batch frames ────────────────>  Sub-agents: read images, write text
-7. Read text summaries <─────────  (image context discarded)
-8. Sync transcript + visual ────>
-9. Produce actionable report
+5. Transcript ──────┘             SRT from download (fast) or Whisper fallback
+6. Analyze frames ──────────────>  ≤20 frames: read directly. >20: sub-agents.
+7. Sync transcript + visual ────>
+8. Produce actionable report
 ```
 
 **Path B -- Audio-first (5 min or longer):** Smarter. Transcribe first, extract only the frames that matter.
@@ -45,18 +44,34 @@ Two paths based on video length. Both keep images out of the main context.
 10. Produce actionable report
 ```
 
-Images only ever exist inside sub-agent contexts. The main agent only reads lightweight text files. This cuts context usage by ~90%.
+For short videos (≤20 frames), read frames directly in the main context — sub-agent overhead is worse than the context cost. For longer videos, delegate to sub-agents to keep context lean.
 
 ## 1. Prerequisites
 
+Check for dependencies. Look in `~/mcp-venv/` first (common on WSL/Mac dev machines), then fall back to system PATH:
+
 ```bash
-which ffmpeg && which ffprobe && which yt-dlp && python3 -c "import whisper" 2>/dev/null && echo "All prerequisites OK" || echo "MISSING DEPENDENCIES"
+PYTHON="$(command -v ~/mcp-venv/bin/python3 2>/dev/null || command -v python3)" && YTDLP="$(command -v ~/mcp-venv/bin/yt-dlp 2>/dev/null || command -v yt-dlp 2>/dev/null)" && PIP="$(command -v ~/mcp-venv/bin/pip 2>/dev/null || command -v pip3 2>/dev/null || command -v pip 2>/dev/null)" && which ffmpeg >/dev/null && which ffprobe >/dev/null && [ -n "$YTDLP" ] && $PYTHON -c "import whisper" 2>/dev/null && echo "All prerequisites OK (python=$PYTHON, yt-dlp=$YTDLP)" || echo "MISSING DEPENDENCIES (python=$PYTHON, yt-dlp=$YTDLP, pip=$PIP)"
 ```
 
-If any are missing, tell the user what to install and STOP:
-- **ffmpeg/ffprobe**: `sudo apt install ffmpeg` (Linux) or `brew install ffmpeg` (macOS)
-- **yt-dlp**: `pip install yt-dlp` or `brew install yt-dlp`
-- **whisper**: `pip install openai-whisper` (local transcription, no API key needed)
+**If `yt-dlp` or `whisper` are missing**, auto-install using whatever pip was found (do NOT stop and ask the user):
+
+```bash
+$PIP install yt-dlp openai-whisper
+```
+
+Then re-resolve `$YTDLP` since it may now exist:
+```bash
+YTDLP="$(command -v ~/mcp-venv/bin/yt-dlp 2>/dev/null || command -v yt-dlp 2>/dev/null)"
+```
+
+**If `ffmpeg`/`ffprobe` are missing**, those require a system package — tell the user and STOP:
+- **Linux**: `sudo apt install ffmpeg`
+- **macOS**: `brew install ffmpeg`
+
+**If no `pip` is found at all**, tell the user to install Python with pip and STOP.
+
+Use `$PYTHON` and `$YTDLP` variables throughout all subsequent commands instead of bare `python3` and `yt-dlp`.
 
 ## 2. Setup
 
@@ -78,8 +93,10 @@ Determine the input type:
 **If Loom URL** (matches `loom.com/share/`):
 
 ```bash
-yt-dlp --force-overwrites --merge-output-format mp4 -o "$TMPDIR/video.mp4" "LOOM_URL"
+$YTDLP --force-overwrites --merge-output-format mp4 --write-subs --write-auto-subs --sub-lang en --convert-subs srt -o "$TMPDIR/video.mp4" "LOOM_URL"
 ```
+
+This downloads the video AND Loom's server-generated transcript as an SRT file (`$TMPDIR/video.en.srt`). If the SRT file exists after download, **skip Whisper transcription entirely** in step A3/B2 — parse the SRT instead (much faster).
 
 If yt-dlp fails (private video, auth required, extractor broken):
 1. Tell the user: "Loom download failed. Please download the MP4 manually from Loom and give me the file path."
@@ -88,7 +105,7 @@ If yt-dlp fails (private video, auth required, extractor broken):
 **If other video URL** (YouTube, Vimeo, etc.):
 
 ```bash
-yt-dlp --force-overwrites --merge-output-format mp4 -o "$TMPDIR/video.mp4" "VIDEO_URL"
+$YTDLP --force-overwrites --merge-output-format mp4 --write-subs --write-auto-subs --sub-lang en --convert-subs srt -o "$TMPDIR/video.mp4" "VIDEO_URL"
 ```
 
 **If local file path** (ends in .mp4, .mov, .webm, .avi, .mkv):
@@ -135,7 +152,7 @@ Choose frame strategy based on duration:
 
 | Duration | Strategy | Command |
 |----------|----------|---------|
-| 0-60s | 1 frame every 2s | `ffmpeg -hide_banner -y -i "$VIDEO" -vf "fps=1/2,scale='min(1280,iw)':-2" -q:v 5 "$TMPDIR/frame_%04d.jpg"` |
+| 0-60s | 1 frame every 5s | `ffmpeg -hide_banner -y -i "$VIDEO" -vf "fps=1/5,scale='min(1280,iw)':-2" -q:v 5 "$TMPDIR/frame_%04d.jpg"` |
 | 1-5min | Scene detection (threshold 0.3) | `ffmpeg -hide_banner -y -i "$VIDEO" -vf "select='gt(scene,0.3)',scale='min(1280,iw)':-2" -vsync vfr -q:v 5 "$TMPDIR/scene_%04d.jpg"` |
 
 **Fallbacks:**
@@ -157,8 +174,37 @@ If no audio stream exists, skip transcription entirely and note "No audio track 
 
 #### A3. Transcribe Audio
 
+**Fast path -- use downloaded subtitles if available:**
+
+Check for `$TMPDIR/video.en.srt` (downloaded from Loom/YouTube in step 3). If it exists, parse the SRT into segments and skip Whisper entirely:
+
 ```bash
-python3 -c "
+$PYTHON -c "
+import re, json
+with open('$TMPDIR/video.en.srt') as f:
+    content = f.read()
+blocks = re.split(r'\n\n+', content.strip())
+segments = []
+for block in blocks:
+    lines = block.strip().split('\n')
+    if len(lines) >= 3:
+        times = re.findall(r'(\d+):(\d+):(\d+)[,.](\d+)', lines[1])
+        if len(times) >= 2:
+            start = int(times[0][0])*3600 + int(times[0][1])*60 + int(times[0][2]) + int(times[0][3])/1000
+            end = int(times[1][0])*3600 + int(times[1][1])*60 + int(times[1][2]) + int(times[1][3])/1000
+            text = ' '.join(lines[2:]).strip()
+            if text:
+                segments.append({'start': start, 'end': end, 'text': text})
+with open('$TMPDIR/transcript.json', 'w') as f:
+    json.dump({'segments': segments}, f, indent=2)
+print(f'SRT parsed: {len(segments)} segments (Whisper skipped)')
+"
+```
+
+**Fallback -- Whisper transcription (only if no SRT exists):**
+
+```bash
+$PYTHON -c "
 import whisper, json
 model = whisper.load_model('base')
 result = model.transcribe('$TMPDIR/audio.wav', word_timestamps=True)
@@ -170,9 +216,18 @@ print('Transcription complete:', len(result['segments']), 'segments')
 
 Then read `$TMPDIR/transcript.json`. Each segment has `start`, `end`, and `text` fields.
 
-#### A4. Delegate Frame Analysis
+#### A4. Analyze Frames
 
-Proceed to **step 6** (Delegate Frame Analysis) with all extracted frames.
+**Choose strategy based on frame count:**
+
+| Frames | Strategy | Why |
+|--------|----------|-----|
+| **20 or fewer** | **Direct** -- read frames in the main context | Sub-agent overhead (~2 min each) far exceeds the context cost of <20 images. Faster by 2-3 minutes. |
+| **More than 20** | **Sub-agents** -- delegate to parallel sub-agents | Keeps main context lean for longer videos with many frames. |
+
+**For 20 or fewer frames:** Read each frame directly using the Read tool. For each frame, note what's visible (UI elements, text, cursor position, changes from previous frame). Then proceed to **step 7** (Synthesize).
+
+**For more than 20 frames:** Proceed to **step 6** (Delegate Frame Analysis).
 
 ---
 
@@ -190,8 +245,14 @@ If no audio stream exists, fall back to **Path A** frame extraction strategies (
 
 #### B2. Transcribe Audio
 
+**Fast path -- use downloaded subtitles if available** (same as A3):
+
+Check for `$TMPDIR/video.en.srt`. If it exists, parse the SRT into segments and skip Whisper. See the SRT parsing script in step A3.
+
+**Fallback -- Whisper transcription (only if no SRT exists):**
+
 ```bash
-python3 -c "
+$PYTHON -c "
 import whisper, json
 model = whisper.load_model('base')
 result = model.transcribe('$TMPDIR/audio.wav', word_timestamps=True)
