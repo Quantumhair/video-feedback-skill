@@ -80,9 +80,10 @@ Use a working-directory-relative temp folder so sub-agents have permission to re
 ```bash
 TMPDIR="$(pwd)/.video-feedback-tmp"
 mkdir -p "$TMPDIR"
+rm -f "$TMPDIR"/frame_*.jpg "$TMPDIR"/scene_*.jpg "$TMPDIR"/targeted_*.jpg "$TMPDIR"/batch_*_analysis.md "$TMPDIR"/video.* "$TMPDIR"/audio.wav "$TMPDIR"/transcript.json
 ```
 
-Previous files in this directory will be overwritten. No need to clean up first.
+This clears all artifacts from previous runs so stale frames/transcripts from a longer video don't bleed into the current analysis.
 
 **Important:** This directory must be inside the current working directory (not `/tmp/`) because sub-agents are sandboxed to the project directory and cannot access `/tmp/`.
 
